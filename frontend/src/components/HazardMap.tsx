@@ -1,8 +1,7 @@
 import React, { useState } from 'react';
 import { MapContainer, TileLayer, CircleMarker, Circle, Popup, Polygon, Polyline, useMap } from 'react-leaflet';
 import { 
-  Eye, 
-  Layers
+  Eye
 } from 'lucide-react';
 import type { DetectionItem } from '../types';
 import { MARINE_ECOSYSTEMS, MAJOR_INDIAN_PORTS } from '../data/indianMissions';
@@ -38,7 +37,6 @@ export const HazardMap: React.FC<HazardMapProps> = ({
   lang
 }) => {
   const [lat, lon] = centerCoords;
-  const t = translations[lang];
 
   // Layer toggles matching screenshot
   const [showSurveyArea, setShowSurveyArea] = useState<boolean>(true);
@@ -405,24 +403,48 @@ export const HazardMap: React.FC<HazardMapProps> = ({
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
               <label style={{ display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={showCoral}
+                  onChange={(e) => setShowCoral(e.target.checked)}
+                  style={{ accentColor: '#F97316', width: '10px', height: '10px' }}
+                />
                 <span style={{ width: '8px', height: '8px', borderRadius: '2px', backgroundColor: '#F97316' }} />
                 <span>Coral Reef</span>
                 <span className="font-hindi" style={{ fontSize: '8.5px', color: '#648296' }}>प्रवाल भित्ति</span>
               </label>
 
               <label style={{ display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={showMangrove}
+                  onChange={(e) => setShowMangrove(e.target.checked)}
+                  style={{ accentColor: '#159A72', width: '10px', height: '10px' }}
+                />
                 <span style={{ width: '8px', height: '8px', borderRadius: '2px', backgroundColor: '#159A72' }} />
                 <span>Mangrove</span>
                 <span className="font-hindi" style={{ fontSize: '8.5px', color: '#648296' }}>मैंग्रोव</span>
               </label>
 
               <label style={{ display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={showSeagrass}
+                  onChange={(e) => setShowSeagrass(e.target.checked)}
+                  style={{ accentColor: '#00C2D7', width: '10px', height: '10px' }}
+                />
                 <span style={{ width: '8px', height: '8px', borderRadius: '2px', backgroundColor: '#00C2D7' }} />
                 <span>Seagrass</span>
                 <span className="font-hindi" style={{ fontSize: '8.5px', color: '#648296' }}>समुद्री घास</span>
               </label>
 
               <label style={{ display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={showProtected}
+                  onChange={(e) => setShowProtected(e.target.checked)}
+                  style={{ accentColor: '#0077B6', width: '10px', height: '10px' }}
+                />
                 <span style={{ width: '8px', height: '8px', borderRadius: '2px', backgroundColor: '#0077B6' }} />
                 <span>Protected Area</span>
                 <span className="font-hindi" style={{ fontSize: '8.5px', color: '#648296' }}>संरक्षित क्षेत्र</span>

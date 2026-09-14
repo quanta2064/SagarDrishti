@@ -28,10 +28,6 @@ import {
   FileSpreadsheet, 
   FileCode, 
   Waves,
-  Sparkles,
-  ShieldCheck,
-  CheckCircle2,
-  AlertTriangle
 } from 'lucide-react';
 
 const API_BASE = 'http://127.0.0.1:8000';
