@@ -1,237 +1,1095 @@
-import streamlit as st
-import cv2
-import numpy as np
-import pandas as pd
-from PIL import Image
-import folium
-from streamlit_folium import st_folium
-import os
+import base64
 import json
 import time
 
-try:
-    from components.mock_pipeline import run_despeckle_and_clahe, detect_anomalies
-except ImportError:
-    pass
+import cv2
+import folium
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+
+from streamlit_folium import st_folium
+
+
+# ============================================================
+# PAGE CONFIGURATION
+# ============================================================
 
 st.set_page_config(
-    page_title='AquaScan | Subsea Debris Command Center',
-    page_icon='🌊',
-    layout='wide',
-    initial_sidebar_state='expanded'
+    page_title="AquaScan | Subsea Detection Command Center",
+    page_icon="🌊",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# Custom Naval Dark Theme Styling
-st.markdown("""
-<style>
-    .stApp {
-        background-color: #0A0E17;
-        color: #E0E6ED;
-    }
-    .metric-box {
-        background: linear-gradient(135deg, #111A2E 0%, #16223B 100%);
-        border: 1px solid #1F3056;
-        border-radius: 8px;
-        padding: 14px;
-        text-align: center;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-    }
-    .metric-value {
-        font-size: 26px;
-        font-weight: 700;
-        color: #00E5FF;
-        margin-top: 4px;
-    }
-    .metric-label {
-        font-size: 11px;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-        color: #8C9BAE;
-    }
-    .badge-critical {
-        background-color: #FF1744;
-        color: white;
-        padding: 3px 8px;
-        border-radius: 4px;
-        font-weight: bold;
-    }
-</style>
-""", unsafe_allow_html=True)
 
-# ----------------- SIDEBAR CONTROLS -----------------
-with st.sidebar:
-    st.image('https://img.icons8.com/fluency/96/submarine.png', width=64)
-    st.title('AQUASCAN')
-    st.caption('Autonomous Sonar Debris & Hazard Radar')
-    st.markdown('---')
+# ============================================================
+# CUSTOM STYLING
+# ============================================================
 
-    st.subheader('🎯 Mission Deployment')
-    mission_mode = st.selectbox(
-        'Select Mission Profile',
-        [
-            '⚡ Live Preset: Post-Hurricane Tampa Bay Recon',
-            '⚡ Live Preset: Tokyo Bay Tsunami Clearance',
-            '📂 Custom Sonar Upload (.png, .tif)'
-        ]
+st.markdown(
+    """
+    <style>
+        .stApp {
+            background-color: #0A0E17;
+            color: #E0E6ED;
+        }
+
+        .metric-box {
+            background: linear-gradient(
+                135deg,
+                #111A2E 0%,
+                #16223B 100%
+            );
+
+            border: 1px solid #1F3056;
+            border-radius: 8px;
+            padding: 14px;
+            text-align: center;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        }
+
+        .metric-value {
+            font-size: 26px;
+            font-weight: 700;
+            color: #00E5FF;
+            margin-top: 4px;
+        }
+
+        .metric-label {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #8C9BAE;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+API_URL = "http://127.0.0.1:8000"
+
+DEFAULT_LATITUDE = 13.0827
+DEFAULT_LONGITUDE = 80.2707
+
+VESSEL_NAME = "AUV Sagar-Kanya"
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def decode_base64_image(data: str):
+    """
+    Decode a backend base64 image into an OpenCV BGR image.
+    """
+
+    if not data:
+        return None
+
+    try:
+        if data.startswith("data:image"):
+            data = data.split(",", 1)[1]
+
+        image_bytes = base64.b64decode(data)
+
+        image_array = np.frombuffer(
+            image_bytes,
+            dtype=np.uint8,
+        )
+
+        return cv2.imdecode(
+            image_array,
+            cv2.IMREAD_COLOR,
+        )
+
+    except Exception:
+        return None
+
+
+def get_marker_color(alert_level: str) -> str:
+    """
+    Return a map marker color based on confidence alert level.
+    """
+
+    level = alert_level.upper()
+
+    if level == "HIGH":
+        return "red"
+
+    if level == "MEDIUM":
+        return "orange"
+
+    return "gold"
+
+
+def format_confidence(value) -> float:
+    """
+    Normalize confidence to a 0-1 value.
+    """
+
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if confidence > 1:
+        confidence /= 100.0
+
+    return max(
+        0.0,
+        min(1.0, confidence),
     )
 
-    st.markdown('---')
-    st.subheader('🎛️ Acoustic AI Controls')
-    conf_threshold = st.slider('Anomaly Confidence Threshold', 0.10, 0.95, 0.40, 0.05)
-    enable_despeckle = st.toggle('Wavelet Despeckling (2D-DWT)', value=True)
-    enforce_shadow = st.toggle('Acoustic Shadow Verification', value=True)
 
-    st.caption('Model: YOLOv8n-Sonar (ONNX Edge Optimized - 6.2 MB)')
-    st.markdown('---')
-    st.info('🚢 **Disaster Mode Active:** Shipping channel safety margin locked to 15.0m clearance.')
+def format_optional(value, suffix=""):
+    """
+    Display optional measurements without inventing values.
+    """
 
-# ----------------- HEADER & METRICS BAR -----------------
-st.title('🌊 Tactical Marine Debris & Hazard Command Center')
-st.caption('Automated Real-Time Sonar Vision Pipeline for Post-Disaster Port Reopening')
+    if value is None:
+        return "Not available"
 
-sample_dir = 'C:/Users/Dell/.gemini/antigravity/scratch/aquascan/data/sample_missions'
-if 'Tampa Bay' in mission_mode:
-    img_path = os.path.join(sample_dir, 'mission_1_tampa_bay.png')
-    raw_img = cv2.imread(img_path)
-    center_coords = [27.8921, -82.4938]
-elif 'Tokyo Bay' in mission_mode:
-    img_path = os.path.join(sample_dir, 'mission_2_tokyo_bay.png')
-    raw_img = cv2.imread(img_path)
-    center_coords = [35.5300, 139.7700]
-else:
-    uploaded = st.file_uploader('Upload Raw Side-Scan Sonar Log', type=['png', 'jpg', 'tif'])
-    if uploaded is not None:
-        file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
-        raw_img = cv2.imdecode(file_bytes, 1)
-        center_coords = [27.8921, -82.4938]
-    else:
-        img_path = os.path.join(sample_dir, 'mission_1_tampa_bay.png')
-        raw_img = cv2.imread(img_path)
-        center_coords = [27.8921, -82.4938]
+    return f"{value}{suffix}"
 
-t0 = time.time()
-if enable_despeckle:
-    preprocessed_img = run_despeckle_and_clahe(raw_img)
-else:
-    preprocessed_img = raw_img.copy()
 
-annotated_img, detections = detect_anomalies(preprocessed_img, conf_thresh=conf_threshold, require_shadow=enforce_shadow)
-proc_time_ms = int((time.time() - t0) * 1000)
+def download_backend_report(
+    job_id: str,
+    report_type: str,
+):
+    """
+    Download a report generated by the FastAPI backend.
+    """
+
+    url = (
+        f"{API_URL}/api/jobs/"
+        f"{job_id}/report/{report_type}"
+    )
+
+    response = requests.get(
+        url,
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    return response.content
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.image(
+        "https://img.icons8.com/fluency/96/submarine.png",
+        width=64,
+    )
+
+    st.title("AQUASCAN")
+
+    st.caption(
+        "AI-Powered Marine Debris & Anomaly Detection"
+    )
+
+    st.markdown("---")
+
+    st.subheader("Mission Deployment")
+
+    st.caption(
+        "Custom Sonar Upload"
+    )
+
+    st.markdown("---")
+
+    st.subheader("Acoustic AI Controls")
+
+    conf_threshold = st.slider(
+        "Detection Confidence Threshold",
+        min_value=0.10,
+        max_value=0.95,
+        value=0.25,
+        step=0.05,
+    )
+
+    st.toggle(
+        "Wavelet Despeckling (2D-DWT)",
+        value=False,
+        disabled=True,
+    )
+
+    st.caption(
+        "Preprocessing control reserved for the "
+        "extended sonar pipeline."
+    )
+
+    st.toggle(
+        "Acoustic Shadow Verification",
+        value=False,
+        disabled=True,
+    )
+
+    st.caption(
+        "Shadow verification is not active in the "
+        "current MVP detector."
+    )
+
+    st.markdown("---")
+
+    st.caption(
+        "Model: SonarSight YOLOv8n"
+    )
+
+    st.caption(
+        "Classes: Pipeline, Shipwreck, Ghost Net, Mine Cylinder"
+    )
+
+    st.info(
+        "Results are generated directly from "
+        "SonarSight YOLOv8n predictions."
+    )
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.title(
+    "Marine Debris & Anomaly Detection Command Center"
+)
+
+st.caption(
+    "AI-Powered Side-Scan Sonar Detection "
+    "for Marine Debris and Anomalies"
+)
+
+
+# ============================================================
+# FILE UPLOAD
+# ============================================================
+
+uploaded = st.file_uploader(
+    "Upload Raw Side-Scan Sonar Image",
+    type=[
+        "png",
+        "jpg",
+        "jpeg",
+        "tif",
+        "tiff",
+    ],
+)
+
+
+# ============================================================
+# INITIAL STATE
+# ============================================================
+
+raw_img = None
+annotated_img = None
+detections = []
+
+center_coords = [
+    DEFAULT_LATITUDE,
+    DEFAULT_LONGITUDE,
+]
+
+job_id = None
+proc_time_ms = 0
+
+
+# ============================================================
+# NO FILE UPLOADED
+# ============================================================
+
+if uploaded is None:
+
+    st.info(
+        "Upload a sonar image to start detection."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# DECODE UPLOADED IMAGE
+# ============================================================
+
+file_bytes = np.asarray(
+    bytearray(
+        uploaded.getvalue()
+    ),
+    dtype=np.uint8,
+)
+
+raw_img = cv2.imdecode(
+    file_bytes,
+    cv2.IMREAD_COLOR,
+)
+
+if raw_img is None:
+
+    st.error(
+        "Could not decode the uploaded image."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# BACKEND AI PIPELINE
+# ============================================================
+
+files = {
+    "file": (
+        uploaded.name,
+        uploaded.getvalue(),
+        uploaded.type or "image/png",
+    )
+}
+
+params = {
+    "conf_threshold": conf_threshold,
+
+    # Current MVP preprocessing is disabled.
+    "enable_despeckle": False,
+
+    # Current MVP shadow verification is disabled.
+    "enforce_shadow": False,
+
+    "latitude": center_coords[0],
+
+    "longitude": center_coords[1],
+
+    "vessel": VESSEL_NAME,
+}
+
+
+with st.spinner(
+    "Running SonarSight YOLOv8n analysis..."
+):
+
+    t0 = time.time()
+
+    try:
+
+        upload_response = requests.post(
+            f"{API_URL}/api/upload",
+            params=params,
+            files=files,
+            timeout=120,
+        )
+
+        upload_response.raise_for_status()
+
+        upload_result = (
+            upload_response.json()
+        )
+
+        job_id = upload_result[
+            "job_id"
+        ]
+
+        result_response = requests.get(
+            f"{API_URL}/api/jobs/"
+            f"{job_id}/results",
+            timeout=30,
+        )
+
+        result_response.raise_for_status()
+
+        result = (
+            result_response.json()
+        )
+
+        # Prefer backend pipeline latency.
+        proc_time_ms = int(
+            result.get(
+                "pipeline_latency_ms",
+                (time.time() - t0) * 1000,
+            )
+        )
+
+    except requests.exceptions.ConnectionError:
+
+        st.error(
+            "Could not connect to the AquaScan backend. "
+            "Make sure FastAPI is running on "
+            "http://127.0.0.1:8000."
+        )
+
+        st.stop()
+
+    except requests.exceptions.Timeout:
+
+        st.error(
+            "The AquaScan backend took too long to respond."
+        )
+
+        st.stop()
+
+    except requests.exceptions.RequestException as e:
+
+        st.error(
+            f"AquaScan backend request failed: {e}"
+        )
+
+        st.stop()
+
+    except Exception as e:
+
+        st.error(
+            f"Unexpected processing error: {e}"
+        )
+
+        st.stop()
+
+
+# ============================================================
+# DECODE BACKEND IMAGES
+# ============================================================
+
+raw_img = decode_base64_image(
+    result.get(
+        "raw_image_base64",
+        "",
+    )
+)
+
+annotated_img = decode_base64_image(
+    result.get(
+        "annotated_image_base64",
+        "",
+    )
+)
+
+if raw_img is None:
+
+    st.error(
+        "Backend returned an invalid raw sonar image."
+    )
+
+    st.stop()
+
+if annotated_img is None:
+
+    st.error(
+        "Backend returned an invalid annotated image."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# NORMALIZE DETECTIONS
+# ============================================================
+
+for detection in result.get(
+    "detections",
+    [],
+):
+
+    confidence = format_confidence(
+        detection.get(
+            "confidence",
+            0,
+        )
+    )
+
+    alert_level = str(
+        detection.get(
+            "severity",
+            "Low",
+        )
+    ).upper()
+
+    detections.append(
+        {
+            "id": detection.get(
+                "detection_id",
+                "DET-0000",
+            ),
+
+            "class_name": detection.get(
+                "class_name",
+                "unknown",
+            ),
+
+            "label": detection.get(
+                "label",
+                detection.get(
+                    "class_name",
+                    "Unknown",
+                ),
+            ),
+
+            "conf": confidence,
+
+            "alert_level": alert_level,
+
+            "lat": detection.get(
+                "lat",
+                center_coords[0],
+            ),
+
+            "lon": detection.get(
+                "lon",
+                center_coords[1],
+            ),
+
+            "depth_m": detection.get(
+                "depth_m"
+            ),
+
+            "dimensions_m": detection.get(
+                "dimensions_m"
+            ),
+
+            "shadow_verified": detection.get(
+                "shadow_verified",
+                False,
+            ),
+
+            "description": detection.get(
+                "description",
+                "Detected sonar target.",
+            ),
+        }
+    )
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+high_count = sum(
+    1
+    for detection in detections
+    if detection["alert_level"] == "HIGH"
+)
+
+
+def render_metric(label, value, value_color="#00E5FF"):
+    """Render a metric card."""
+
+    html = (
+        f'<div class="metric-box">'
+        f'<div class="metric-label">{label}</div>'
+        f'<div class="metric-value" style="color:{value_color};">'
+        f'{value}'
+        f'</div>'
+        f'</div>'
+    )
+
+    st.markdown(
+        html,
+        unsafe_allow_html=True,
+    )
+
 
 c1, c2, c3, c4 = st.columns(4)
+
 with c1:
-    st.markdown("""<div class="metric-box"><div class="metric-label">Acoustic Area Scanned</div><div class="metric-value">4.85 km²</div></div>""", unsafe_allow_html=True)
+    render_metric(
+        "Acoustic Area Scanned",
+        "N/A",
+    )
+
 with c2:
-    st.markdown(f"""<div class="metric-box"><div class="metric-label">Debris Anomalies Found</div><div class="metric-value">{len(detections)} Targets</div></div>""", unsafe_allow_html=True)
+    render_metric(
+        "Targets Detected",
+        len(detections),
+    )
+
 with c3:
-    critical_count = sum(1 for d in detections if d['severity'] == 'CRITICAL')
-    st.markdown(f"""<div class="metric-box"><div class="metric-label">Critical Channel Blockers</div><div class="metric-value" style="color:#FF1744">{critical_count} Alert</div></div>""", unsafe_allow_html=True)
+    render_metric(
+        "High-Confidence Alerts",
+        high_count,
+        "#FF1744",
+    )
+
 with c4:
-    st.markdown(f"""<div class="metric-box"><div class="metric-label">Pipeline Latency</div><div class="metric-value" style="color:#00E676">{proc_time_ms + 18} ms</div></div>""", unsafe_allow_html=True)
+    render_metric(
+        "Pipeline Latency",
+        f"{proc_time_ms} ms",
+        "#00E676",
+    )
 
-st.write('')
+st.write("")
 
-tab_vision, tab_map, tab_audit = st.tabs([
-    '👁️ Tactical Sonar Vision (Split-View)',
-    '🗺️ Geospatial Hazard Map (Folium)',
-    '📋 Official Clearance Audit & Export'
-])
+
+# ============================================================
+# MAIN TABS
+# ============================================================
+
+tab_vision, tab_map, tab_report = st.tabs(
+    [
+        "Tactical Sonar Vision",
+        "Geospatial Detection Map",
+        "Detection Report & Export",
+    ]
+)
+
+
+# ============================================================
+# TAB 1: SONAR VISION
+# ============================================================
 
 with tab_vision:
+
     col_raw, col_ai = st.columns(2)
+
     with col_raw:
-        st.subheader('1. Raw Acoustic Side-Scan Sonogram')
-        st.caption('Direct sensor feed displaying acoustic speckle noise and seabed clutter')
-        st.image(cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+        st.subheader(
+            "1. Raw Acoustic Side-Scan Sonogram"
+        )
+
+        st.caption(
+            "Original uploaded side-scan sonar image"
+        )
+
+        st.image(
+            raw_img,
+            channels="BGR",
+            use_container_width=True,
+        )
 
     with col_ai:
-        st.subheader('2. AquaScan AI Anomaly Detection')
-        st.caption('Wavelet despeckled with geometric shadow validation overlays')
-        st.image(cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+        st.subheader(
+            "2. AquaScan AI Detection"
+        )
+
+        st.caption(
+            "SonarSight YOLOv8n detection overlays"
+        )
+
+        st.image(
+            annotated_img,
+            channels="BGR",
+            use_container_width=True,
+        )
+
+
+# ============================================================
+# TAB 2: GEOSPATIAL MAP
+# ============================================================
 
 with tab_map:
-    st.subheader('🌐 Real-Time Navigational Hazard Overlay')
-    st.caption('Interactive maritime chart with localized debris coordinates and collision risk tiers')
 
-    m = folium.Map(location=center_coords, zoom_start=14, tiles='CartoDB dark_matter')
+    st.subheader(
+        "Detected Sonar Targets"
+    )
 
-    fairway_coords = [
-        [center_coords[0] - 0.015, center_coords[1] - 0.008],
-        [center_coords[0] + 0.015, center_coords[1] - 0.004],
-        [center_coords[0] + 0.015, center_coords[1] + 0.004],
-        [center_coords[0] - 0.015, center_coords[1] + 0.001]
-    ]
-    folium.Polygon(
-        locations=fairway_coords,
-        color='#00E5FF',
-        weight=1,
-        fill=True,
-        fill_color='#00E5FF',
-        fill_opacity=0.08,
-        tooltip='Designated Commercial Deep-Draft Fairway'
-    ).add_to(m)
+    st.caption(
+        "Interactive map showing detections "
+        "at the supplied scan coordinates."
+    )
 
-    for d in detections:
-        marker_color = 'red' if d['severity'] == 'CRITICAL' else ('orange' if d['severity'] == 'HIGH' else 'gold')
+    map_object = folium.Map(
+        location=center_coords,
+        zoom_start=14,
+        tiles="CartoDB dark_matter",
+    )
+
+    # --------------------------------------------------------
+    # DETECTION MARKERS
+    # --------------------------------------------------------
+
+    for detection in detections:
+
+        marker_color = get_marker_color(
+            detection["alert_level"]
+        )
+
+        depth_text = format_optional(
+            detection["depth_m"],
+            " m",
+        )
+
+        dimensions_text = format_optional(
+            detection["dimensions_m"]
+        )
+
         popup_html = f"""
-        <div style='width:220px; font-family:sans-serif;'>
-            <h4 style='margin:0; color:#111;'>{d['class']}</h4>
-            <hr style='margin:4px 0;'/>
-            <b>ID:</b> {d['id']}<br/>
-            <b>Confidence:</b> {int(d['conf']*100)}%<br/>
-            <b>Clearance Depth:</b> {d['depth_m']} m<br/>
-            <b>Dimensions:</b> {d['dimensions_m']}<br/>
-            <b>Severity:</b> <span style='color:{marker_color}; font-weight:bold;'>{d['severity']}</span><br/>
-            <p style='font-size:11px; margin-top:5px;'>{d['description']}</p>
+        <div style="
+            width:220px;
+            font-family:sans-serif;
+        ">
+
+            <h4 style="
+                margin:0;
+                color:#111;
+            ">
+                {detection["label"]}
+            </h4>
+
+            <hr style="
+                margin:4px 0;
+            "/>
+
+            <b>ID:</b>
+            {detection["id"]}
+            <br/>
+
+            <b>Confidence:</b>
+            {int(detection["conf"] * 100)}%
+            <br/>
+
+            <b>Depth:</b>
+            {depth_text}
+            <br/>
+
+            <b>Dimensions:</b>
+            {dimensions_text}
+            <br/>
+
+            <b>Alert Level:</b>
+
+            <span style="
+                color:{marker_color};
+                font-weight:bold;
+            ">
+                {detection["alert_level"]}
+            </span>
+
+            <br/>
+
+            <p style="
+                font-size:11px;
+                margin-top:5px;
+            ">
+                {detection["description"]}
+            </p>
+
         </div>
         """
+
         folium.CircleMarker(
-            location=[d['lat'], d['lon']],
+            location=[
+                detection["lat"],
+                detection["lon"],
+            ],
+
             radius=9,
+
             color=marker_color,
+
             fill=True,
+
             fill_color=marker_color,
+
             fill_opacity=0.85,
-            tooltip=f"{d['class']} [{d['severity']}] - Click for Intel",
-            popup=folium.Popup(popup_html, max_width=260)
-        ).add_to(m)
 
-    st_folium(m, width=None, height=480)
+            tooltip=(
+                f"{detection['label']} "
+                f"[{detection['alert_level']}]"
+            ),
 
-with tab_audit:
-    st.subheader('📑 Navigational Risk Manifest')
+            popup=folium.Popup(
+                popup_html,
+                max_width=260,
+            ),
+        ).add_to(map_object)
+
+    # --------------------------------------------------------
+    # MAP
+    # --------------------------------------------------------
+
+    st_folium(
+        map_object,
+        width=None,
+        height=480,
+    )
+
+
+# ============================================================
+# TAB 3: DETECTION REPORT
+# ============================================================
+
+with tab_report:
+
+    st.subheader(
+        "Detection Report"
+    )
+
+    # --------------------------------------------------------
+    # TABLE DATA
+    # --------------------------------------------------------
 
     table_data = []
-    for d in detections:
-        table_data.append({
-            'Hazard ID': d['id'],
-            'Target Classification': d['class'],
-            'Confidence': f"{int(d['conf']*100)}%",
-            'Severity': d['severity'],
-            'Latitude': d['lat'],
-            'Longitude': d['lon'],
-            'Dimensions': d['dimensions_m'],
-            'Acoustic Shadow Verified': 'YES' if d['shadow_verified'] else 'NO',
-            'Action Required': 'Deploy Dredge / Salvage' if d['severity'] == 'CRITICAL' else 'Chart Warning'
-        })
-    df = pd.DataFrame(table_data)
-    st.dataframe(df, use_container_width=True)
+
+    for detection in detections:
+
+        table_data.append(
+            {
+                "Detection ID": (
+                    detection["id"]
+                ),
+
+                "Target Classification": (
+                    detection["label"]
+                ),
+
+                "Confidence": (
+                    f"{int(detection['conf'] * 100)}%"
+                ),
+
+                "Alert Level": (
+                    detection["alert_level"]
+                ),
+
+                "Latitude": (
+                    detection["lat"]
+                ),
+
+                "Longitude": (
+                    detection["lon"]
+                ),
+
+                "Depth (m)": (
+                    detection["depth_m"]
+                    if detection["depth_m"]
+                    is not None
+                    else "Not available"
+                ),
+
+                "Dimensions": (
+                    detection["dimensions_m"]
+                    if detection["dimensions_m"]
+                    is not None
+                    else "Not available"
+                ),
+
+                "Action Required": (
+                    "Review / Investigate"
+                    if detection["alert_level"]
+                    == "HIGH"
+                    else "Review"
+                ),
+            }
+        )
+
+
+    # --------------------------------------------------------
+    # EMPTY DETECTION TABLE
+    # --------------------------------------------------------
+
+    if table_data:
+
+        df = pd.DataFrame(
+            table_data
+        )
+
+    else:
+
+        df = pd.DataFrame(
+            columns=[
+                "Detection ID",
+                "Target Classification",
+                "Confidence",
+                "Alert Level",
+                "Latitude",
+                "Longitude",
+                "Depth (m)",
+                "Dimensions",
+                "Action Required",
+            ]
+        )
+
+
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+    # --------------------------------------------------------
+    # EXPORT BUTTONS
+    # --------------------------------------------------------
 
     b1, b2, b3 = st.columns(3)
+
+
+    # ========================================================
+    # CSV
+    # ========================================================
+
     with b1:
-        csv_bytes = df.to_csv(index=False).encode('utf-8')
-        st.download_button('📥 Download CSV Log (Port Authority)', csv_bytes, 'aquascan_hazards.csv', 'text/csv')
+
+        csv_bytes = (
+            df.to_csv(
+                index=False
+            ).encode("utf-8")
+        )
+
+        st.download_button(
+            "Download Detection CSV",
+
+            data=csv_bytes,
+
+            file_name=(
+                "aquascan_detections.csv"
+            ),
+
+            mime="text/csv",
+
+            use_container_width=True,
+        )
+
+
+    # ========================================================
+    # GEOJSON
+    # ========================================================
+
     with b2:
-        geojson_data = {
-            'type': 'FeatureCollection',
-            'features': [
+
+        features = []
+
+        for detection in detections:
+
+            properties = {
+                "detection_id": (
+                    detection["id"]
+                ),
+
+                "class": (
+                    detection["class_name"]
+                ),
+
+                "label": (
+                    detection["label"]
+                ),
+
+                "confidence": (
+                    round(
+                        detection["conf"],
+                        4,
+                    )
+                ),
+
+                "alert_level": (
+                    detection["alert_level"]
+                ),
+
+                "depth_m": (
+                    detection["depth_m"]
+                ),
+
+                "dimensions_m": (
+                    detection["dimensions_m"]
+                ),
+
+                "shadow_verified": (
+                    detection[
+                        "shadow_verified"
+                    ]
+                ),
+
+                "description": (
+                    detection["description"]
+                ),
+            }
+
+            features.append(
                 {
-                    'type': 'Feature',
-                    'geometry': {'type': 'Point', 'coordinates': [d['lon'], d['lat']]},
-                    'properties': d
-                } for d in detections
-            ]
+                    "type": "Feature",
+
+                    "geometry": {
+                        "type": "Point",
+
+                        "coordinates": [
+                            detection["lon"],
+                            detection["lat"],
+                        ],
+                    },
+
+                    "properties": properties,
+                }
+            )
+
+
+        geojson_data = {
+            "type": "FeatureCollection",
+            "features": features,
         }
-        st.download_button('🗺️ Download GeoJSON (Marine GIS)', json.dumps(geojson_data, indent=2), 'aquascan_hazards.geojson', 'application/json')
+
+
+        st.download_button(
+            "Download Detection GeoJSON",
+
+            data=json.dumps(
+                geojson_data,
+                indent=2,
+            ),
+
+            file_name=(
+                "aquascan_detections.geojson"
+            ),
+
+            mime="application/geo+json",
+
+            use_container_width=True,
+        )
+
+
+    # ========================================================
+    # PDF
+    # ========================================================
+
     with b3:
-        st.button('🖨️ Export Certified Port Clearance PDF', help='Generates official audit certificate for harbor master.')
+
+        try:
+
+            pdf_bytes = (
+                download_backend_report(
+                    job_id,
+                    "pdf",
+                )
+            )
+
+            st.download_button(
+                "Export Detection Report",
+
+                data=pdf_bytes,
+
+                file_name=(
+                    "aquascan_detection_report.pdf"
+                ),
+
+                mime="application/pdf",
+
+                use_container_width=True,
+            )
+
+        except Exception:
+
+            st.warning(
+                "PDF report is temporarily unavailable."
+            )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.markdown("---")
+
+st.caption(
+    "AquaScan | SonarSight YOLOv8n | "
+    "AI-powered side-scan sonar detection"
+)
+
+st.caption(
+    "Alert levels represent model confidence "
+    "and should not be interpreted as physical "
+    "hazard severity."
+)

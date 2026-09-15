@@ -1,271 +1,1361 @@
 """
-SagarDrishti (सागरदृष्टि) - Structured Report Generator (JSON, CSV, PDF)
-Generates audit reports adhering strictly to the PRD schema:
-- JSON with survey metadata, detections, dual risk stratification, and summary
-- CSV for QGIS / ArcGIS geographic information systems
-- PDF executive hazard dossier for Indian maritime authorities and environmental agencies
+AquaScan - Structured Report Generator
+
+Generates:
+    - JSON detection reports
+    - CSV detection reports
+    - PDF detection reports
+
+The reports contain only information actually available from
+the current AquaScan MVP pipeline.
+
+Detection model:
+    SonarSight YOLOv8n
+
+Supported classes:
+    - submarine_pipeline
+    - shipwreck
+    - ghost_net
+    - mine_cylinder
+
+Important:
+    Model confidence is used for the alert level.
+    It does not represent physical hazard severity.
+
+    Depth, physical dimensions, acoustic shadow measurements,
+    navigation risk, ecosystem risk, and fairway clearance are
+    reported as unavailable unless supplied by another pipeline
+    component.
 """
 
 import io
-import json
 import csv
-from datetime import datetime
+
+from datetime import datetime, timezone
 from typing import Dict, Any, List
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+)
+from reportlab.lib.styles import (
+    getSampleStyleSheet,
+    ParagraphStyle,
+)
+
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+CLASS_NAMES = [
+    "submarine_pipeline",
+    "shipwreck",
+    "ghost_net",
+    "mine_cylinder",
+]
+
+SEVERITY_LEVELS = [
+    "CRITICAL",
+    "HIGH",
+    "MEDIUM",
+    "LOW",
+]
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _utc_date() -> str:
+    """Return the current UTC date as YYYY-MM-DD."""
+
+    return datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%d")
+
+
+def _utc_timestamp() -> str:
+    """Return the current UTC timestamp in ISO format."""
+
+    return (
+        datetime.now(timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _format_confidence(value: Any) -> float:
+    """
+    Convert model confidence into a percentage.
+
+    The detector normally supplies confidence as 0.0-1.0.
+    This helper also accepts an already-converted percentage.
+    """
+
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if 0.0 <= confidence <= 1.0:
+        confidence *= 100.0
+
+    return round(
+        max(0.0, min(100.0, confidence)),
+        1,
+    )
+
+
+def _parse_dimensions(
+    dimensions: Any,
+    length_value: Any,
+    width_value: Any,
+):
+    """
+    Parse dimensions only when they are actually supplied.
+
+    Examples accepted:
+        "15x4.5m"
+        "15 x 4.5 m"
+
+    Returns:
+        (length_m, width_m)
+    """
+
+    length_m = length_value
+    width_m = width_value
+
+    if (
+        isinstance(dimensions, str)
+        and "x" in dimensions.lower()
+    ):
+
+        try:
+
+            cleaned = (
+                dimensions
+                .lower()
+                .replace("m", "")
+                .strip()
+            )
+
+            parts = cleaned.split("x")
+
+            if len(parts) >= 2:
+
+                parsed_length = float(
+                    parts[0].strip()
+                )
+
+                parsed_width = float(
+                    parts[1].strip()
+                )
+
+                length_m = parsed_length
+                width_m = parsed_width
+
+        except (
+            ValueError,
+            TypeError,
+        ):
+            pass
+
+    return length_m, width_m
+
+
+def _safe_value(
+    value: Any,
+    default: Any = None,
+):
+    """
+    Return default only when value is missing.
+
+    Unlike the old implementation, this does not inject
+    fabricated physical measurements.
+    """
+
+    if value is None:
+        return default
+
+    return value
+
+
+# ============================================================
+# JSON REPORT
+# ============================================================
 
 def generate_json_report(
     survey_meta: Dict[str, Any],
     detections: List[Dict[str, Any]],
-    false_positive_count: int = 8
+    false_positive_count: int = 0,
 ) -> Dict[str, Any]:
-    now_str = datetime.utcnow().strftime("%Y-%m-%d")
-    report_id = f"SD-IN-{now_str}-{survey_meta.get('job_id', '001')[-4:].upper()}"
+    """
+    Generate the structured AquaScan JSON report.
+    """
 
-    by_class = {"shipwreck": 0, "pipe_cylinder": 0, "debris_net": 0, "misc_anomaly": 0}
-    by_severity = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    now_str = _utc_date()
+
+    job_id = str(
+        survey_meta.get(
+            "job_id",
+            "001",
+        )
+    )
+
+    report_id = (
+        f"AS-{now_str}-"
+        f"{job_id[-4:].upper()}"
+    )
+
+    # --------------------------------------------------------
+    # CLASS COUNTS
+    # --------------------------------------------------------
+
+    by_class = {
+        class_name: 0
+        for class_name in CLASS_NAMES
+    }
+
+    # --------------------------------------------------------
+    # SEVERITY COUNTS
+    # --------------------------------------------------------
+
+    by_severity = {
+        severity: 0
+        for severity in SEVERITY_LEVELS
+    }
+
+    # --------------------------------------------------------
+    # FORMAT DETECTIONS
+    # --------------------------------------------------------
 
     formatted_dets = []
-    for idx, d in enumerate(detections):
-        det_id = d.get("id", f"HAZ-{idx+1:04d}")
-        cls = d.get("class", "misc_anomaly")
-        if cls not in by_class:
-            by_class[cls] = 0
-        by_class[cls] += 1
 
-        sev = d.get("severity", "MEDIUM")
-        if sev not in by_severity:
-            by_severity[sev] = 0
-        by_severity[sev] += 1
+    for idx, detection in enumerate(
+        detections
+    ):
 
-        dim_l = d.get("length_m", 15.0)
-        dim_w = d.get("width_m", 4.5)
-        if "dimensions_m" in d and isinstance(d["dimensions_m"], str) and "x" in d["dimensions_m"]:
-            parts = d["dimensions_m"].replace("m", "").split("x")
-            try:
-                dim_l = float(parts[0].strip())
-                dim_w = float(parts[1].strip())
-            except Exception:
-                pass
+        det_id = detection.get(
+            "id",
+            f"DET-{idx + 1:04d}",
+        )
 
-        formatted_dets.append({
-            "detection_id": det_id,
-            "class": cls,
-            "confidence": round(d.get("confidence", d.get("conf", 0.85)) * 100, 1),
-            "severity": sev,
-            "navigation_risk": d.get("navigation_risk", sev),
-            "ecosystem_risk": d.get("ecosystem_risk", "HIGH"),
-            "potential_impact": d.get("potential_impact", "Benthic flora disruption"),
-            "clearance_priority": d.get("clearance_priority", "MONITORED CONTACT"),
-            "location": {
-                "latitude": d.get("lat", 13.0827),
-                "longitude": d.get("lon", 80.2707),
-                "depth_m": d.get("depth_m", 18.5)
-            },
-            "bounding_dimensions": {
-                "length_m": dim_l,
-                "width_m": dim_w
-            },
-            "acoustic_shadow_length_m": d.get("shadow_length_m", 8.4),
-            "tile_source": d.get("tile_source", "tile_0042.png"),
-            "timestamp": d.get("timestamp", datetime.utcnow().isoformat() + "Z")
-        })
+        class_name = detection.get(
+            "class",
+            "unknown",
+        )
+
+        if class_name not in by_class:
+            by_class[class_name] = 0
+
+        by_class[class_name] += 1
+
+        severity = str(
+            detection.get(
+                "severity",
+                "Low",
+            )
+        ).upper()
+
+        if severity not in by_severity:
+            by_severity[severity] = 0
+
+        by_severity[severity] += 1
+
+        # ----------------------------------------------------
+        # CONFIDENCE
+        # ----------------------------------------------------
+
+        confidence = _format_confidence(
+            detection.get(
+                "confidence",
+                detection.get(
+                    "conf",
+                    0.0,
+                ),
+            )
+        )
+
+        # ----------------------------------------------------
+        # DIMENSIONS
+        # ----------------------------------------------------
+
+        length_m, width_m = (
+            _parse_dimensions(
+                detection.get(
+                    "dimensions_m"
+                ),
+                detection.get(
+                    "length_m"
+                ),
+                detection.get(
+                    "width_m"
+                ),
+            )
+        )
+
+        # ----------------------------------------------------
+        # LOCATION
+        # ----------------------------------------------------
+
+        latitude = detection.get(
+            "lat"
+        )
+
+        longitude = detection.get(
+            "lon"
+        )
+
+        depth_m = detection.get(
+            "depth_m"
+        )
+
+        # ----------------------------------------------------
+        # OPTIONAL ANALYSIS
+        # ----------------------------------------------------
+
+        navigation_risk = detection.get(
+            "navigation_risk"
+        )
+
+        ecosystem_risk = detection.get(
+            "ecosystem_risk"
+        )
+
+        potential_impact = detection.get(
+            "potential_impact"
+        )
+
+        clearance_priority = detection.get(
+            "clearance_priority"
+        )
+
+        shadow_length = detection.get(
+            "shadow_length_m"
+        )
+
+        tile_source = detection.get(
+            "tile_source"
+        )
+
+        timestamp = detection.get(
+            "timestamp",
+            _utc_timestamp(),
+        )
+
+        # ----------------------------------------------------
+        # DESCRIPTION
+        # ----------------------------------------------------
+
+        description = detection.get(
+            "description"
+        )
+
+        if not description:
+
+            description = (
+                f"Potential {class_name.replace('_', ' ')} "
+                f"detected by SonarSight YOLOv8n "
+                f"with {confidence:.1f}% confidence."
+            )
+
+        # ----------------------------------------------------
+        # APPEND DETECTION
+        # ----------------------------------------------------
+
+        formatted_dets.append(
+            {
+                "detection_id": det_id,
+
+                "class": class_name,
+
+                "confidence": confidence,
+
+                "severity": severity,
+
+                "navigation_risk": (
+                    navigation_risk
+                ),
+
+                "ecosystem_risk": (
+                    ecosystem_risk
+                ),
+
+                "potential_impact": (
+                    potential_impact
+                ),
+
+                "clearance_priority": (
+                    clearance_priority
+                ),
+
+                "description": description,
+
+                "location": {
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "depth_m": depth_m,
+                },
+
+                "bounding_dimensions": {
+                    "length_m": length_m,
+                    "width_m": width_m,
+                },
+
+                "dimensions_m": detection.get(
+                    "dimensions_m"
+                ),
+
+                "acoustic_shadow_length_m": (
+                    shadow_length
+                ),
+
+                "shadow_verified": detection.get(
+                    "shadow_verified",
+                    False,
+                ),
+
+                "bbox": detection.get(
+                    "bbox",
+                    [],
+                ),
+
+                "color_rgb": detection.get(
+                    "color_rgb"
+                ),
+
+                "tile_source": tile_source,
+
+                "timestamp": timestamp,
+            }
+        )
+
+    # ========================================================
+    # REPORT
+    # ========================================================
 
     return {
         "report_id": report_id,
-        "platform": "SagarDrishti सागरदृष्टि (AI-Powered Marine Intelligence for India)",
+
+        "platform": (
+            "AquaScan - AI-Powered "
+            "Underwater Marine Detection"
+        ),
+
+        "model": (
+            "SonarSight YOLOv8n"
+        ),
+
         "survey_metadata": {
-            "survey_date": survey_meta.get("survey_date", now_str),
-            "vessel": survey_meta.get("vessel", "INS Makar (Hydrographic Catamaran)"),
-            "sonar_model": survey_meta.get("sonar_model", "EdgeTech 4125 (455/900 kHz)"),
-            "region": survey_meta.get("region", "Coromandel Coast / Bay of Bengal"),
-            "sea_basin": survey_meta.get("sea_basin", "Bay of Bengal"),
-            "total_area_sqm": survey_meta.get("total_area_sqm", 145000)
+            "survey_date": survey_meta.get(
+                "survey_date",
+                now_str,
+            ),
+
+            "vessel": survey_meta.get(
+                "vessel",
+                "Unknown Vessel",
+            ),
+
+            "sonar_model": survey_meta.get(
+                "sonar_model",
+                "Unknown Sonar",
+            ),
+
+            "region": survey_meta.get(
+                "region",
+                "Unknown",
+            ),
+
+            "sea_basin": survey_meta.get(
+                "sea_basin",
+                "Unknown",
+            ),
+
+            "total_area_sqm": survey_meta.get(
+                "total_area_sqm"
+            ),
         },
+
         "detections": formatted_dets,
+
         "summary": {
-            "total_detections": len(formatted_dets),
+            "total_detections": len(
+                formatted_dets
+            ),
+
             "by_class": by_class,
+
             "by_severity": by_severity,
-            "false_positive_filtered": false_positive_count
-        }
+
+            "false_positive_filtered": (
+                false_positive_count
+            ),
+
+            "fairway_clearance_status": (
+                "NOT ASSESSED"
+            ),
+
+            "recommended_action": (
+                "Review detected targets"
+                if formatted_dets
+                else "No targets detected"
+            ),
+        },
     }
 
-def generate_csv_report(json_report: Dict[str, Any]) -> str:
+
+# ============================================================
+# CSV REPORT
+# ============================================================
+
+def generate_csv_report(
+    json_report: Dict[str, Any]
+) -> str:
+    """
+    Generate a CSV report suitable for
+    spreadsheet/GIS processing.
+    """
+
     output = io.StringIO()
-    writer = csv.writer(output)
 
-    writer.writerow([
-        "detection_id", "class", "confidence_pct", "severity",
-        "navigation_risk", "ecosystem_risk", "potential_impact", "clearance_priority",
-        "latitude", "longitude", "depth_m",
-        "length_m", "width_m", "acoustic_shadow_length_m",
-        "tile_source", "timestamp"
-    ])
+    writer = csv.writer(
+        output
+    )
 
-    for det in json_report.get("detections", []):
-        writer.writerow([
-            det["detection_id"],
-            det["class"],
-            det["confidence"],
-            det["severity"],
-            det.get("navigation_risk", det["severity"]),
-            det.get("ecosystem_risk", "HIGH"),
-            det.get("potential_impact", ""),
-            det.get("clearance_priority", ""),
-            det["location"]["latitude"],
-            det["location"]["longitude"],
-            det["location"]["depth_m"],
-            det["bounding_dimensions"]["length_m"],
-            det["bounding_dimensions"]["width_m"],
-            det["acoustic_shadow_length_m"],
-            det["tile_source"],
-            det["timestamp"]
-        ])
+    writer.writerow(
+        [
+            "detection_id",
+            "class",
+            "confidence_pct",
+            "severity",
+            "latitude",
+            "longitude",
+            "depth_m",
+            "length_m",
+            "width_m",
+            "acoustic_shadow_length_m",
+            "shadow_verified",
+            "navigation_risk",
+            "ecosystem_risk",
+            "potential_impact",
+            "clearance_priority",
+            "tile_source",
+            "timestamp",
+        ]
+    )
+
+    for detection in json_report.get(
+        "detections",
+        [],
+    ):
+
+        location = detection.get(
+            "location",
+            {},
+        )
+
+        dimensions = detection.get(
+            "bounding_dimensions",
+            {},
+        )
+
+        writer.writerow(
+            [
+                detection.get(
+                    "detection_id"
+                ),
+
+                detection.get(
+                    "class"
+                ),
+
+                detection.get(
+                    "confidence"
+                ),
+
+                detection.get(
+                    "severity"
+                ),
+
+                location.get(
+                    "latitude"
+                ),
+
+                location.get(
+                    "longitude"
+                ),
+
+                location.get(
+                    "depth_m"
+                ),
+
+                dimensions.get(
+                    "length_m"
+                ),
+
+                dimensions.get(
+                    "width_m"
+                ),
+
+                detection.get(
+                    "acoustic_shadow_length_m"
+                ),
+
+                detection.get(
+                    "shadow_verified",
+                    False,
+                ),
+
+                detection.get(
+                    "navigation_risk"
+                ),
+
+                detection.get(
+                    "ecosystem_risk"
+                ),
+
+                detection.get(
+                    "potential_impact"
+                ),
+
+                detection.get(
+                    "clearance_priority"
+                ),
+
+                detection.get(
+                    "tile_source"
+                ),
+
+                detection.get(
+                    "timestamp"
+                ),
+            ]
+        )
 
     return output.getvalue()
 
-def generate_pdf_report(json_report: Dict[str, Any]) -> bytes:
+
+# ============================================================
+# PDF REPORT
+# ============================================================
+
+def generate_pdf_report(
+    json_report: Dict[str, Any]
+) -> bytes:
+    """
+    Generate a concise AquaScan PDF detection report.
+    """
+
     buffer = io.BytesIO()
+
     doc = SimpleDocTemplate(
         buffer,
+
         pagesize=letter,
+
         rightMargin=36,
         leftMargin=36,
+
         topMargin=36,
-        bottomMargin=36
+        bottomMargin=36,
     )
 
     styles = getSampleStyleSheet()
-    
+
+    # --------------------------------------------------------
+    # STYLES
+    # --------------------------------------------------------
+
     title_style = ParagraphStyle(
-        'SagarTitle',
-        parent=styles['Heading1'],
-        fontName='Helvetica-Bold',
+        "AquaScanTitle",
+
+        parent=styles["Heading1"],
+
+        fontName="Helvetica-Bold",
+
         fontSize=18,
-        textColor=colors.HexColor('#06283D'),
-        spaceAfter=4
-    )
-    
-    subtitle_style = ParagraphStyle(
-        'SagarSubtitle',
-        parent=styles['Normal'],
-        fontName='Helvetica',
-        fontSize=10,
-        textColor=colors.HexColor('#0077B6'),
-        spaceAfter=12
+
+        textColor=colors.HexColor(
+            "#06283D"
+        ),
+
+        spaceAfter=4,
     )
 
-    h2_style = ParagraphStyle(
-        'SagarH2',
-        parent=styles['Heading2'],
-        fontName='Helvetica-Bold',
+    subtitle_style = ParagraphStyle(
+        "AquaScanSubtitle",
+
+        parent=styles["Normal"],
+
+        fontName="Helvetica",
+
+        fontSize=10,
+
+        textColor=colors.HexColor(
+            "#0077B6"
+        ),
+
+        spaceAfter=12,
+    )
+
+    heading_style = ParagraphStyle(
+        "AquaScanHeading",
+
+        parent=styles["Heading2"],
+
+        fontName="Helvetica-Bold",
+
         fontSize=11,
-        textColor=colors.HexColor('#06283D'),
+
+        textColor=colors.HexColor(
+            "#06283D"
+        ),
+
         spaceBefore=10,
-        spaceAfter=6
+
+        spaceAfter=6,
     )
 
     body_style = ParagraphStyle(
-        'SagarBody',
-        parent=styles['Normal'],
-        fontName='Helvetica',
+        "AquaScanBody",
+
+        parent=styles["Normal"],
+
+        fontName="Helvetica",
+
         fontSize=8.5,
-        textColor=colors.HexColor('#335368'),
-        leading=12
+
+        textColor=colors.HexColor(
+            "#335368"
+        ),
+
+        leading=12,
     )
+
+    footnote_style = ParagraphStyle(
+        "AquaScanFootnote",
+
+        parent=styles["Italic"],
+
+        fontSize=7,
+
+        textColor=colors.HexColor(
+            "#648296"
+        ),
+    )
+
+    # --------------------------------------------------------
+    # DATA
+    # --------------------------------------------------------
+
+    meta = json_report.get(
+        "survey_metadata",
+        {},
+    )
+
+    summary = json_report.get(
+        "summary",
+        {},
+    )
+
+    detections = json_report.get(
+        "detections",
+        [],
+    )
+
+    # --------------------------------------------------------
+    # DOCUMENT ELEMENTS
+    # --------------------------------------------------------
 
     elements = []
 
-    # Title & Header
-    elements.append(Paragraph("SAGARDRISHTI // सागरदृष्टि", title_style))
-    elements.append(Paragraph(
-        f"AI-Powered Marine Intelligence for India — Hydrographic Debris & Marine Ecosystem Risk Dossier | Report ID: <b>{json_report['report_id']}</b>",
-        subtitle_style
-    ))
-    elements.append(Spacer(1, 6))
+    # --------------------------------------------------------
+    # TITLE
+    # --------------------------------------------------------
 
-    # Survey Metadata Table
-    meta = json_report.get("survey_metadata", {})
-    summary = json_report.get("summary", {})
-    meta_data = [
-        ["Survey Date:", str(meta.get("survey_date", "N/A")), "Survey Vessel:", str(meta.get("vessel", "INS Makar"))],
-        ["Sonar Sensor:", str(meta.get("sonar_model", "EdgeTech 4125")), "Region / Sea Basin:", f"{meta.get('region', 'Coromandel Coast')} ({meta.get('sea_basin', 'Bay of Bengal')})"],
-        ["Total Contacts:", str(summary.get("total_detections", 0)), "False Positives Rejected:", str(summary.get("false_positive_filtered", 0))]
-    ]
-    meta_table = Table(meta_data, colWidths=[110, 155, 120, 155])
-    meta_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#EAF4F7')),
-        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#06283D')),
-        ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-        ('FONTSIZE', (0, 0), (-1, -1), 8),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-        ('TOPPADDING', (0, 0), (-1, -1), 4),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#D4E7EF')),
-    ]))
-    elements.append(meta_table)
-    elements.append(Spacer(1, 10))
-
-    # Tactical & Ecosystem Summary
-    crit_count = summary.get("by_severity", {}).get("CRITICAL", 0)
-    clearance = "RESTRICTED / OBSTRUCTION IN FAIRWAY" if crit_count > 0 else "NOMINAL / SAFE PASSAGE"
-    clearance_color = "#DC2626" if crit_count > 0 else "#159A72"
-    
-    summary_text = (
-        f"<b>Fairway Clearance Assessment:</b> <font color='{clearance_color}'><b>{clearance}</b></font><br/>"
-        f"The SagarDrishti neural sonar pipeline detected <b>{summary.get('total_detections', 0)}</b> anomalous submerged contacts. "
-        f"Wavelet 2D-DWT despeckling and acoustic shadow validation successfully filtered <b>{summary.get('false_positive_filtered', 0)}</b> "
-        f"natural acoustic reverberations and seabed sand ripples. "
-        f"Critical navigation hazards: <b>{crit_count}</b>. High priority ecological threats: <b>{summary.get('by_severity', {}).get('HIGH', 0)}</b>."
+    elements.append(
+        Paragraph(
+            "AQUASCAN",
+            title_style,
+        )
     )
-    elements.append(Paragraph(summary_text, body_style))
-    elements.append(Spacer(1, 10))
 
-    # Detections Table
-    elements.append(Paragraph("Identified Underwater Hazards & Ecosystem Threat Matrix", h2_style))
-    
-    det_headers = ["ID", "Class", "Conf %", "Nav Risk", "Eco Risk", "Lat / Lon", "Depth", "Dimensions", "Clearance Priority"]
-    det_rows = [det_headers]
+    elements.append(
+        Paragraph(
+            (
+                "AI-Powered Underwater Marine "
+                "Debris & Anomaly Detection Report "
+                "| Report ID: "
+                f"<b>{json_report.get('report_id', 'N/A')}</b>"
+            ),
+            subtitle_style,
+        )
+    )
 
-    for d in json_report.get("detections", []):
-        loc = d["location"]
-        dims = d["bounding_dimensions"]
-        det_rows.append([
-            d["detection_id"],
-            d["class"].replace("_", " ").title(),
-            f"{d['confidence']}%",
-            d.get("navigation_risk", d["severity"]),
-            d.get("ecosystem_risk", "HIGH"),
-            f"{loc['latitude']:.4f}, {loc['longitude']:.4f}",
-            f"{loc['depth_m']}m",
-            f"{dims['length_m']}x{dims['width_m']}m",
-            d.get("clearance_priority", "MONITORED")
-        ])
+    elements.append(
+        Spacer(1, 6)
+    )
 
-    det_table = Table(det_rows, colWidths=[55, 70, 40, 55, 55, 90, 40, 65, 80])
-    det_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0077B6')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 7),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F4FAFC')]),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#D4E7EF')),
-        ('TOPPADDING', (0, 0), (-1, -1), 4),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-    ]))
-    elements.append(det_table)
-    elements.append(Spacer(1, 14))
+    # --------------------------------------------------------
+    # MODEL INFORMATION
+    # --------------------------------------------------------
 
-    # Sign-off footnote
-    elements.append(Paragraph(
-        "<i>Generated autonomously by SagarDrishti (सागरदृष्टि) Maritime AI Platform. Designed for Indian Oceans and the National Blue Economy Framework.</i>",
-        ParagraphStyle('Footnote', parent=styles['Italic'], fontSize=7, textColor=colors.HexColor('#648296'))
-    ))
+    elements.append(
+        Paragraph(
+            "Analysis Information",
+            heading_style,
+        )
+    )
 
-    doc.build(elements)
+    model_name = json_report.get(
+        "model",
+        "SonarSight YOLOv8n",
+    )
+
+    analysis_data = [
+        [
+            "Detection Model:",
+            str(model_name),
+            "Total Targets:",
+            str(
+                summary.get(
+                    "total_detections",
+                    0,
+                )
+            ),
+        ],
+
+        [
+            "Survey Date:",
+            str(
+                meta.get(
+                    "survey_date",
+                    "N/A",
+                )
+            ),
+
+            "False Positives Filtered:",
+            str(
+                summary.get(
+                    "false_positive_filtered",
+                    0,
+                )
+            ),
+        ],
+
+        [
+            "Vessel:",
+            str(
+                meta.get(
+                    "vessel",
+                    "N/A",
+                )
+            ),
+
+            "Area:",
+            (
+                "N/A"
+                if meta.get(
+                    "total_area_sqm"
+                ) in (None, 0)
+                else f"{meta.get('total_area_sqm')} m²"
+            ),
+        ],
+
+        [
+            "Sonar:",
+            str(
+                meta.get(
+                    "sonar_model",
+                    "N/A",
+                )
+            ),
+
+            "Region:",
+            str(
+                meta.get(
+                    "region",
+                    "N/A",
+                )
+            ),
+        ],
+    ]
+
+    analysis_table = Table(
+        analysis_data,
+
+        colWidths=[
+            105,
+            160,
+            125,
+            140,
+        ],
+    )
+
+    analysis_table.setStyle(
+        TableStyle(
+            [
+                (
+                    "BACKGROUND",
+                    (0, 0),
+                    (-1, -1),
+                    colors.HexColor(
+                        "#EAF4F7"
+                    ),
+                ),
+
+                (
+                    "TEXTCOLOR",
+                    (0, 0),
+                    (-1, -1),
+                    colors.HexColor(
+                        "#06283D"
+                    ),
+                ),
+
+                (
+                    "FONTNAME",
+                    (0, 0),
+                    (-1, -1),
+                    "Helvetica",
+                ),
+
+                (
+                    "FONTSIZE",
+                    (0, 0),
+                    (-1, -1),
+                    8,
+                ),
+
+                (
+                    "BOTTOMPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    5,
+                ),
+
+                (
+                    "TOPPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    5,
+                ),
+
+                (
+                    "GRID",
+                    (0, 0),
+                    (-1, -1),
+                    0.5,
+                    colors.HexColor(
+                        "#D4E7EF"
+                    ),
+                ),
+            ]
+        )
+    )
+
+    elements.append(
+        analysis_table
+    )
+
+    elements.append(
+        Spacer(1, 12)
+    )
+
+    # --------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------
+
+    elements.append(
+        Paragraph(
+            "Detection Summary",
+            heading_style,
+        )
+    )
+
+    total_detections = summary.get(
+        "total_detections",
+        0,
+    )
+
+    by_severity = summary.get(
+        "by_severity",
+        {},
+    )
+
+    high_count = by_severity.get(
+        "HIGH",
+        0,
+    )
+
+    medium_count = by_severity.get(
+        "MEDIUM",
+        0,
+    )
+
+    low_count = by_severity.get(
+        "LOW",
+        0,
+    )
+
+    summary_text = (
+        f"<b>{total_detections}</b> "
+        "potential sonar targets were detected "
+        "by SonarSight YOLOv8n. "
+        f"<b>{high_count}</b> targets have High "
+        "model-confidence, "
+        f"<b>{medium_count}</b> have Medium "
+        "model-confidence, and "
+        f"<b>{low_count}</b> have Low "
+        "model-confidence."
+        "<br/><br/>"
+        "<b>Important:</b> Confidence-based alert "
+        "levels indicate model confidence only. "
+        "They do not represent physical hazard "
+        "severity or navigation clearance."
+    )
+
+    elements.append(
+        Paragraph(
+            summary_text,
+            body_style,
+        )
+    )
+
+    elements.append(
+        Spacer(1, 12)
+    )
+
+    # --------------------------------------------------------
+    # DETECTION TABLE
+    # --------------------------------------------------------
+
+    elements.append(
+        Paragraph(
+            "Detected Targets",
+            heading_style,
+        )
+    )
+
+    det_headers = [
+        "ID",
+        "Class",
+        "Confidence",
+        "Alert",
+        "Latitude",
+        "Longitude",
+        "Depth",
+        "Dimensions",
+    ]
+
+    det_rows = [
+        det_headers
+    ]
+
+    for detection in detections:
+
+        location = detection.get(
+            "location",
+            {},
+        )
+
+        dimensions = detection.get(
+            "bounding_dimensions",
+            {},
+        )
+
+        latitude = location.get(
+            "latitude"
+        )
+
+        longitude = location.get(
+            "longitude"
+        )
+
+        depth = location.get(
+            "depth_m"
+        )
+
+        length_m = dimensions.get(
+            "length_m"
+        )
+
+        width_m = dimensions.get(
+            "width_m"
+        )
+
+        # ----------------------------------------------------
+        # FORMAT LOCATION
+        # ----------------------------------------------------
+
+        if (
+            latitude is not None
+            and longitude is not None
+        ):
+
+            lat_lon = (
+                f"{float(latitude):.4f}"
+            )
+
+            lon_text = (
+                f"{float(longitude):.4f}"
+            )
+
+        else:
+
+            lat_lon = "N/A"
+            lon_text = "N/A"
+
+        # ----------------------------------------------------
+        # FORMAT DEPTH
+        # ----------------------------------------------------
+
+        depth_text = (
+            f"{depth} m"
+            if depth is not None
+            else "N/A"
+        )
+
+        # ----------------------------------------------------
+        # FORMAT DIMENSIONS
+        # ----------------------------------------------------
+
+        if (
+            length_m is not None
+            and width_m is not None
+        ):
+
+            dimensions_text = (
+                f"{length_m} x "
+                f"{width_m} m"
+            )
+
+        else:
+
+            dimensions_text = "N/A"
+
+        # ----------------------------------------------------
+        # APPEND ROW
+        # ----------------------------------------------------
+
+        det_rows.append(
+            [
+                detection.get(
+                    "detection_id",
+                    "N/A",
+                ),
+
+                detection.get(
+                    "class",
+                    "Unknown",
+                )
+                .replace("_", " ")
+                .title(),
+
+                f"{detection.get('confidence', 0)}%",
+
+                detection.get(
+                    "severity",
+                    "N/A",
+                ),
+
+                lat_lon,
+
+                lon_text,
+
+                depth_text,
+
+                dimensions_text,
+            ]
+        )
+
+    # --------------------------------------------------------
+    # EMPTY RESULT
+    # --------------------------------------------------------
+
+    if not detections:
+
+        det_rows.append(
+            [
+                "-",
+                "No targets detected",
+                "-",
+                "-",
+                "-",
+                "-",
+                "N/A",
+                "N/A",
+            ]
+        )
+
+    # --------------------------------------------------------
+    # TABLE
+    # --------------------------------------------------------
+
+    detection_table = Table(
+        det_rows,
+
+        colWidths=[
+            48,
+            78,
+            58,
+            45,
+            70,
+            70,
+            50,
+            70,
+        ],
+
+        repeatRows=1,
+    )
+
+    detection_table.setStyle(
+        TableStyle(
+            [
+                (
+                    "BACKGROUND",
+                    (0, 0),
+                    (-1, 0),
+                    colors.HexColor(
+                        "#0077B6"
+                    ),
+                ),
+
+                (
+                    "TEXTCOLOR",
+                    (0, 0),
+                    (-1, 0),
+                    colors.white,
+                ),
+
+                (
+                    "FONTNAME",
+                    (0, 0),
+                    (-1, 0),
+                    "Helvetica-Bold",
+                ),
+
+                (
+                    "FONTSIZE",
+                    (0, 0),
+                    (-1, -1),
+                    7,
+                ),
+
+                (
+                    "ALIGN",
+                    (0, 0),
+                    (-1, -1),
+                    "CENTER",
+                ),
+
+                (
+                    "VALIGN",
+                    (0, 0),
+                    (-1, -1),
+                    "MIDDLE",
+                ),
+
+                (
+                    "ROWBACKGROUNDS",
+                    (0, 1),
+                    (-1, -1),
+                    [
+                        colors.white,
+                        colors.HexColor(
+                            "#F4FAFC"
+                        ),
+                    ],
+                ),
+
+                (
+                    "GRID",
+                    (0, 0),
+                    (-1, -1),
+                    0.5,
+                    colors.HexColor(
+                        "#D4E7EF"
+                    ),
+                ),
+
+                (
+                    "TOPPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    4,
+                ),
+
+                (
+                    "BOTTOMPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    4,
+                ),
+            ]
+        )
+    )
+
+    elements.append(
+        detection_table
+    )
+
+    elements.append(
+        Spacer(1, 14)
+    )
+
+    # --------------------------------------------------------
+    # DATA LIMITATIONS
+    # --------------------------------------------------------
+
+    elements.append(
+        Paragraph(
+            (
+                "<b>Data availability:</b> "
+                "Depth, physical dimensions, acoustic-shadow "
+                "measurements, and fairway clearance are "
+                "reported as N/A when calibrated sonar "
+                "metadata or dedicated analysis is unavailable."
+            ),
+            body_style,
+        )
+    )
+
+    elements.append(
+        Spacer(1, 10)
+    )
+
+    # --------------------------------------------------------
+    # FOOTNOTE
+    # --------------------------------------------------------
+
+    elements.append(
+        Paragraph(
+            (
+                "<i>Generated by AquaScan using "
+                "SonarSight YOLOv8n. "
+                "Detection results should be reviewed "
+                "by an appropriate operator before "
+                "operational decisions are made.</i>"
+            ),
+            footnote_style,
+        )
+    )
+
+    # --------------------------------------------------------
+    # BUILD PDF
+    # --------------------------------------------------------
+
+    doc.build(
+        elements
+    )
+
     buffer.seek(0)
+
     return buffer.getvalue()

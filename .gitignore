@@ -42,6 +42,7 @@ Thumbs.db
 uploads/
 outputs/
 reports/
+temp_*.png
 
 # Large datasets
 data/dataset/
@@ -51,3 +52,11 @@ training/dataset/
 # ML experiment outputs
 runs/
 wandb/
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
