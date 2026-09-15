@@ -22,6 +22,7 @@ The backend provides:
     - JSON/CSV/PDF report generation
     - Detection filtering
     - Annotated image retrieval
+    - Demo/sample mission presets
 """
 
 import os
@@ -131,7 +132,10 @@ class DetectionItem(BaseModel):
     class_name: str
     label: str
 
+    # React frontend expects percentage: 0-100
     confidence: float
+
+    # React frontend uses uppercase levels
     severity: str
 
     location: DetectionLocation
@@ -246,6 +250,24 @@ def img_to_base64(img_bgr: np.ndarray) -> str:
     return f"data:image/png;base64,{encoded_bytes}"
 
 
+def normalize_severity(severity: str) -> str:
+    """
+    Normalize SonarSight severity values to the
+    uppercase format expected by the React frontend.
+    """
+
+    normalized = str(severity).strip().upper()
+
+    mapping = {
+        "HIGH": "HIGH",
+        "MEDIUM": "MEDIUM",
+        "LOW": "LOW",
+        "CRITICAL": "CRITICAL",
+    }
+
+    return mapping.get(normalized, normalized)
+
+
 # ============================================================
 # MAIN ANALYSIS PIPELINE
 # ============================================================
@@ -287,8 +309,8 @@ def run_full_pipeline(
 
     h, w = raw_bgr.shape[:2]
 
-    # Tile generation is retained for pipeline compatibility.
-    # Current YOLO inference operates on the supplied image.
+    # Retained for pipeline compatibility.
+    # Current SonarSight inference runs on the supplied image.
     generate_tiles(
         (h, w),
         tile_size=640,
@@ -324,14 +346,16 @@ def run_full_pipeline(
 
     t2 = time.time()
 
-    annotated_bgr, detections_raw, false_positives_count = (
-        detector.detect(
-            processed_bgr,
-            conf_threshold=conf_threshold,
-            enforce_shadow=enforce_shadow,
-            center_lat=center_lat,
-            center_lon=center_lon,
-        )
+    (
+        annotated_bgr,
+        detections_raw,
+        false_positives_count,
+    ) = detector.detect(
+        processed_bgr,
+        conf_threshold=conf_threshold,
+        enforce_shadow=enforce_shadow,
+        center_lat=center_lat,
+        center_lon=center_lon,
     )
 
     stages["detection_ms"] = int(
@@ -357,9 +381,8 @@ def run_full_pipeline(
         "region": region_name,
         "sea_basin": basin_name,
 
-        # Actual surveyed area is unavailable from a
-        # single uploaded image without calibrated sonar
-        # geometry / track data.
+        # A single uploaded image does not provide
+        # calibrated surveyed area.
         "total_area_sqm": 0,
     }
 
@@ -390,50 +413,42 @@ def run_full_pipeline(
     )
 
     # --------------------------------------------------------
-    # FORMAT DETECTIONS FOR API
+    # FORMAT DETECTIONS FOR REACT FRONTEND
     # --------------------------------------------------------
 
     formatted_detections: List[DetectionItem] = []
 
     for d in detections_raw:
 
+        class_name = d["class"]
+
+        label = d.get(
+            "label",
+            CLASS_LABELS.get(
+                class_name,
+                class_name.replace("_", " ").title(),
+            ),
+        )
+
+        severity = normalize_severity(
+            d.get("severity", "LOW")
+        )
+
+        confidence = round(
+            float(d.get("confidence", 0.0)) * 100.0,
+            1,
+        )
+
         formatted_detections.append(
             DetectionItem(
                 detection_id=d["id"],
                 id=d["id"],
 
-                class_name=d["class"],
+                class_name=class_name,
+                label=label,
 
-                label=d.get(
-                    "label",
-                    CLASS_LABELS.get(
-                        d["class"],
-                        d["class"],
-                    ),
-                ),
-
-                confidence=round(
-                    d["confidence"] * 100.0,
-                    1,
-                ),
-
-                severity=d["severity"],
-
-                navigation_risk=d.get(
-                    "navigation_risk"
-                ),
-
-                ecosystem_risk=d.get(
-                    "ecosystem_risk"
-                ),
-
-                potential_impact=d.get(
-                    "potential_impact"
-                ),
-
-                clearance_priority=d.get(
-                    "clearance_priority"
-                ),
+                confidence=confidence,
+                severity=severity,
 
                 location=DetectionLocation(
                     latitude=d["lat"],
@@ -470,7 +485,7 @@ def run_full_pipeline(
                     "color_rgb",
                     list(
                         CLASS_COLORS_RGB.get(
-                            d["class"],
+                            class_name,
                             (0, 168, 204),
                         )
                     ),
@@ -489,8 +504,18 @@ def run_full_pipeline(
                     "tile_source"
                 ),
 
-                timestamp=datetime.utcnow().isoformat()
-                + "Z",
+                timestamp=(
+                    datetime.utcnow()
+                    .isoformat()
+                    + "Z"
+                ),
+
+                # These remain None because the current
+                # MVP does not calculate them.
+                navigation_risk=None,
+                ecosystem_risk=None,
+                potential_impact=None,
+                clearance_priority=None,
             )
         )
 
@@ -499,17 +524,10 @@ def run_full_pipeline(
     # --------------------------------------------------------
 
     if formatted_detections:
-
-        clearance_status = "NOT ASSESSED"
-
         recommended_action = (
             "Review detected targets"
         )
-
     else:
-
-        clearance_status = "NOT ASSESSED"
-
         recommended_action = (
             "No targets detected"
         )
@@ -523,16 +541,19 @@ def run_full_pipeline(
             "summary"
         ]["by_class"],
 
-        by_severity=json_report[
-            "summary"
-        ]["by_severity"],
+        by_severity={
+            normalize_severity(k): v
+            for k, v in json_report[
+                "summary"
+            ]["by_severity"].items()
+        },
 
         false_positive_filtered=(
             false_positives_count
         ),
 
         fairway_clearance_status=(
-            clearance_status
+            "NOT ASSESSED"
         ),
 
         recommended_action=(
@@ -543,11 +564,8 @@ def run_full_pipeline(
     # --------------------------------------------------------
     # DISASTER READINESS
     # --------------------------------------------------------
-    #
-    # This feature is not calculated by the current MVP.
-    # Keep it optional rather than returning fabricated values.
-    # --------------------------------------------------------
 
+    # Not calculated by the current MVP.
     disaster_readiness = None
 
     # --------------------------------------------------------
@@ -564,8 +582,7 @@ def run_full_pipeline(
             center_lon,
         ],
 
-        # A single uploaded image does not provide
-        # calibrated surveyed area.
+        # No calibrated sonar coverage calculation.
         scanned_area_km2=0.0,
 
         pipeline_latency_ms=total_latency_ms,
@@ -625,28 +642,22 @@ def health():
 
     return {
         "status": "ONLINE",
-
         "system": "AquaScan Marine Detection Platform",
-
         "version": "1.0.0",
-
         "pipeline": (
             "SonarSight YOLOv8n Detection"
         ),
-
         "model_loaded": (
             detector.model_loaded
         ),
-
         "demo_mode": False,
-
         "edge_ready": True,
     }
 
 
-# ------------------------------------------------------------
+# ============================================================
 # EDGE / MODEL INFORMATION
-# ------------------------------------------------------------
+# ============================================================
 
 @app.get("/api/edge/benchmarks")
 def edge_benchmarks():
@@ -655,16 +666,15 @@ def edge_benchmarks():
         "benchmarks": (
             get_edge_hardware_benchmarks()
         ),
-
         "model_specifications": (
             get_model_specifications()
         ),
     }
 
 
-# ------------------------------------------------------------
-# MISSION PRESETS
-# ------------------------------------------------------------
+# ============================================================
+# DEMO / SAMPLE MISSION PRESETS
+# ============================================================
 
 @app.get(
     "/api/mission/preset",
@@ -679,6 +689,8 @@ def get_mission_preset(
 
     pid = preset_id.lower()
 
+    # These are intentionally retained as DEMO/SAMPLE
+    # mission presets for the existing dashboard.
     if pid in [
         "mumbai",
         "tokyo_bay",
@@ -690,7 +702,7 @@ def get_mission_preset(
         )
 
         title = (
-            "Mumbai Harbour Sonar Survey"
+            "DEMO — Mumbai Harbour Sonar Survey"
         )
 
         center = [
@@ -699,10 +711,12 @@ def get_mission_preset(
         ]
 
         vessel = (
-            "RV Samudra Ratnakar"
+            "DEMO — RV Samudra Ratnakar"
         )
 
-        sensor = "Klein 3000 SSS"
+        sensor = (
+            "DEMO — Klein 3000 SSS"
+        )
 
         region = (
             "Maharashtra"
@@ -721,7 +735,7 @@ def get_mission_preset(
         )
 
         title = (
-            "Odisha Coastal Sonar Survey"
+            "DEMO — Odisha Coastal Sonar Survey"
         )
 
         center = [
@@ -729,10 +743,12 @@ def get_mission_preset(
             86.6710,
         ]
 
-        vessel = "AUV Sagar-Kanya"
+        vessel = (
+            "DEMO — AUV Sagar-Kanya"
+        )
 
         sensor = (
-            "EdgeTech 4125 Dual-Freq"
+            "DEMO — EdgeTech 4125 Dual-Freq"
         )
 
         region = "Odisha"
@@ -747,7 +763,7 @@ def get_mission_preset(
         )
 
         title = (
-            "Andaman Marine Sonar Survey"
+            "DEMO — Andaman Marine Sonar Survey"
         )
 
         center = [
@@ -755,9 +771,13 @@ def get_mission_preset(
             92.7265,
         ]
 
-        vessel = "AUV Matsya-III"
+        vessel = (
+            "DEMO — AUV Matsya-III"
+        )
 
-        sensor = "Reson SeaBat S7K"
+        sensor = (
+            "DEMO — Reson SeaBat S7K"
+        )
 
         region = (
             "Andaman & Nicobar Islands"
@@ -773,7 +793,7 @@ def get_mission_preset(
         )
 
         title = (
-            "Lakshadweep Marine Sonar Survey"
+            "DEMO — Lakshadweep Marine Sonar Survey"
         )
 
         center = [
@@ -781,10 +801,12 @@ def get_mission_preset(
             72.1900,
         ]
 
-        vessel = "AUV Sagar-Nidhi"
+        vessel = (
+            "DEMO — AUV Sagar-Nidhi"
+        )
 
         sensor = (
-            "EdgeTech 4125"
+            "DEMO — EdgeTech 4125"
         )
 
         region = "Lakshadweep"
@@ -799,7 +821,7 @@ def get_mission_preset(
         )
 
         title = (
-            "Kerala Coastal Sonar Survey"
+            "DEMO — Kerala Coastal Sonar Survey"
         )
 
         center = [
@@ -807,10 +829,12 @@ def get_mission_preset(
             76.2673,
         ]
 
-        vessel = "RV Sagar Sampada"
+        vessel = (
+            "DEMO — RV Sagar Sampada"
+        )
 
         sensor = (
-            "EdgeTech 4125"
+            "DEMO — EdgeTech 4125"
         )
 
         region = "Kerala"
@@ -825,7 +849,7 @@ def get_mission_preset(
         )
 
         title = (
-            "Chennai Coastal Sonar Survey"
+            "DEMO — Chennai Coastal Sonar Survey"
         )
 
         center = [
@@ -834,11 +858,11 @@ def get_mission_preset(
         ]
 
         vessel = (
-            "INS Makar"
+            "DEMO — INS Makar"
         )
 
         sensor = (
-            "EdgeTech 4125"
+            "DEMO — EdgeTech 4125"
         )
 
         region = (
@@ -848,7 +872,7 @@ def get_mission_preset(
         basin = "Bay of Bengal"
 
     # --------------------------------------------------------
-    # LOAD PRESET IMAGE
+    # LOAD DEMO IMAGE
     # --------------------------------------------------------
 
     raw_bgr = cv2.imread(
@@ -859,7 +883,7 @@ def get_mission_preset(
         raise HTTPException(
             status_code=404,
             detail=(
-                f"Preset image not found: "
+                f"Demo preset image not found: "
                 f"{img_path}"
             ),
         )
@@ -896,9 +920,9 @@ def get_mission_preset(
     )
 
 
-# ------------------------------------------------------------
+# ============================================================
 # CUSTOM SONAR UPLOAD
-# ------------------------------------------------------------
+# ============================================================
 
 @app.post("/api/upload")
 async def upload_sonar(
@@ -964,6 +988,10 @@ async def upload_sonar(
         longitude,
 
         vessel_name=vessel,
+
+        # The uploaded image does not carry
+        # a verified sonar hardware identifier.
+        sonar_model="Uploaded Sonar Image",
 
         conf_threshold=(
             conf_threshold
@@ -1090,6 +1118,12 @@ def get_job_detections(
 
     filtered = []
 
+    normalized_requested_severity = (
+        normalize_severity(severity)
+        if severity
+        else None
+    )
+
     for detection in detections:
 
         if (
@@ -1108,9 +1142,9 @@ def get_job_detections(
             continue
 
         if (
-            severity
+            normalized_requested_severity
             and detection.severity
-            != severity
+            != normalized_requested_severity
         ):
             continue
 

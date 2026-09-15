@@ -73,7 +73,9 @@ export default function App() {
       isOpen: true,
       stage: 'PARSING',
       progress: 20,
-      message: lang === 'hi' ? 'सोनार डेटा पार्सिंग एवं पिंग पैकेट निष्कर्षण...' : 'Extracting side-scan sonar waterfall ping packets...'
+      message: lang === 'hi'
+        ? 'सोनार छवि तैयार की जा रही है...'
+        : 'Preparing sonar image...'
     });
 
     try {
@@ -82,7 +84,9 @@ export default function App() {
         isOpen: true,
         stage: 'PREPROCESSING',
         progress: 50,
-        message: lang === 'hi' ? '2D-DWT वेवलेट डीस्पेकलिंग एवं CLAHE कंट्रास्ट संतुलन...' : 'Applying 2D-DWT wavelet despeckling and CLAHE contrast balance...'
+        message: lang === 'hi'
+          ? 'वैकल्पिक सोनार प्रीप्रोसेसिंग लागू की जा रही है...'
+          : 'Applying optional sonar preprocessing...'
       });
 
       await new Promise(r => setTimeout(r, 220));
@@ -90,7 +94,9 @@ export default function App() {
         isOpen: true,
         stage: 'DETECTION',
         progress: 80,
-        message: lang === 'hi' ? 'YOLOv8n-CBAM न्यूरल डिटेक्शन एवं ध्वनिक छाया सत्यापन...' : 'Running YOLOv8n+CBAM multi-scale inference and shadow validation...'
+        message: lang === 'hi'
+          ? 'SonarSight YOLOv8n डिटेक्शन चलाया जा रहा है...'
+          : 'Running SonarSight YOLOv8n detection...'
       });
 
       const url = `${API_BASE}/api/mission/preset?preset_id=${presetId}&conf_threshold=${confThreshold}&enable_despeckle=${enableDespeckle}&enforce_shadow=${enforceShadow}`;
@@ -102,7 +108,9 @@ export default function App() {
         isOpen: true,
         stage: 'REPORT_GENERATION',
         progress: 100,
-        message: lang === 'hi' ? 'WGS84 भू-टैगिंग एवं IHO S-100 समुद्री खतरा डोजियर...' : 'Finalizing WGS84 geotagging and IHO S-100 hazard dossier...'
+        message: lang === 'hi'
+          ? 'डिटेक्शन रिपोर्ट तैयार की जा रही है...'
+          : 'Preparing AquaScan detection report...'
       });
       await new Promise(r => setTimeout(r, 180));
 
@@ -141,7 +149,7 @@ export default function App() {
         isOpen: true,
         stage: 'PREPROCESSING',
         progress: 50,
-        message: 'Wavelet 2D-DWT filtering and adaptive range gain equalization...'
+        message: 'Applying optional sonar preprocessing...'
       });
 
       const url = `${API_BASE}/api/upload?conf_threshold=${confThreshold}&enable_despeckle=${enableDespeckle}&enforce_shadow=${enforceShadow}`;
@@ -154,7 +162,7 @@ export default function App() {
         isOpen: true,
         stage: 'DETECTION',
         progress: 80,
-        message: 'Neural acoustic detection and shadow physics geometry check...'
+        message: 'Running SonarSight YOLOv8n detection...'
       });
       await new Promise(r => setTimeout(r, 250));
 
@@ -167,7 +175,7 @@ export default function App() {
         isOpen: true,
         stage: 'REPORT_GENERATION',
         progress: 100,
-        message: 'Synthesizing GIS manifest and geospatial projection...'
+        message: 'Preparing detection results and report...'
       });
       await new Promise(r => setTimeout(r, 200));
 
@@ -248,7 +256,7 @@ export default function App() {
         lang={lang}
         onToggleLang={() => setLang(prev => (prev === 'en' ? 'hi' : 'en'))}
         onOpenReportModal={() => setReportModalOpen(true)}
-        latencyMs={data?.pipeline_latency_ms || 184}
+        latencyMs={data?.pipeline_latency_ms ?? 0}
       />
 
       {/* Main Layout Container */}
@@ -277,8 +285,8 @@ export default function App() {
                   onSelectMission={(id) => setPreset(id)}
                   lang={lang}
                   hazardsCount={data.detections.length}
-                  scannedAreaKm2={data.scanned_area_km2 || 42.8}
-                  latencyMs={data.pipeline_latency_ms || 184}
+                  scannedAreaKm2={data.scanned_area_km2 }
+                  latencyMs={data.pipeline_latency_ms }
                 />
               </div>
 
@@ -341,12 +349,12 @@ export default function App() {
                   lang={lang}
                 />
                 <KeyMetricsBar
-                  surveyAreaKm2={data.scanned_area_km2 || 42.8}
-                  hazardsDetected={data.detections.length || 17}
-                  criticalBlockers={data.summary.by_severity.CRITICAL || 4}
+                  surveyAreaKm2={data.scanned_area_km2}
+                  hazardsDetected={data.detections.length }
+                  criticalBlockers={data.summary.by_severity.CRITICAL || 0}
                   coastalRegions={5}
                   ecosystemsMonitored={3}
-                  latencyMs={data.pipeline_latency_ms || 184}
+                  latencyMs={data.pipeline_latency_ms}
                   lang={lang}
                 />
               </div>
@@ -453,7 +461,7 @@ export default function App() {
                     {t.sonarIntelligence}
                   </h2>
                   <p style={{ fontSize: '12px', color: '#648296', margin: '2px 0 0 0' }}>
-                    Sensor: <b>{data.survey_metadata?.sonar_model || 'EdgeTech 4125'}</b> | Vessel: <b>{data.survey_metadata?.vessel || 'INS Makar'}</b>
+                    Sensor: <b>{data.survey_metadata?.sonar_model || 'N/A'}</b> | Vessel: <b>{data.survey_metadata?.vessel || 'N/A'}</b>
                   </p>
                 </div>
                 <div style={{ display: 'flex', gap: '8px' }}>
@@ -809,7 +817,7 @@ export default function App() {
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '14px', marginBottom: '20px', fontSize: '12px' }}>
                   <div style={{ backgroundColor: '#F8FAFC', padding: '10px 12px', borderRadius: '8px' }}>
                     <span style={{ color: '#648296', fontSize: '10.5px' }}>Survey Vessel</span>
-                    <div style={{ fontWeight: 700, color: '#06283D' }}>{data.survey_metadata?.vessel || 'INS Makar'}</div>
+                    <div style={{ fontWeight: 700, color: '#06283D' }}>{data.survey_metadata?.vessel || 'N/A'}</div>
                   </div>
                   <div style={{ backgroundColor: '#F8FAFC', padding: '10px 12px', borderRadius: '8px' }}>
                     <span style={{ color: '#648296', fontSize: '10.5px' }}>Total Hazards Tagged</span>
@@ -817,7 +825,7 @@ export default function App() {
                   </div>
                   <div style={{ backgroundColor: '#F8FAFC', padding: '10px 12px', borderRadius: '8px' }}>
                     <span style={{ color: '#648296', fontSize: '10.5px' }}>Scanned Coverage</span>
-                    <div style={{ fontWeight: 700, color: '#06283D' }}>{data.scanned_area_km2 || 42.8} km²</div>
+                    <div style={{ fontWeight: 700, color: '#06283D' }}>{data.scanned_area_km2 > 0 ? `${data.scanned_area_km2} km²` : 'N/A'}</div>
                   </div>
                 </div>
 
